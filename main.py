@@ -29,8 +29,11 @@ def main():
     # Step 1: Basic Baseline
     print("\n📌 STEP 1: Running Basic RAG Baseline...")
     print("-" * 40)
-    from naive_baseline import main as run_baseline
-    run_baseline()
+    if not os.path.exists("reports/naive_baseline_report.json"):
+        from naive_baseline import main as run_baseline
+        run_baseline()
+    else:
+        print("  ✓ Found existing reports/naive_baseline_report.json")
 
     # Step 2: Production Pipeline
     print("\n📌 STEP 2: Running Production Pipeline...")

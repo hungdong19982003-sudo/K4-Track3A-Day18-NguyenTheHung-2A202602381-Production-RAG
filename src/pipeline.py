@@ -68,19 +68,27 @@ def run_query(query: str, search: HybridSearch, reranker: CrossEncoderReranker) 
     reranked = reranker.rerank(query, docs, top_k=RERANK_TOP_K)
     contexts = [r.text for r in reranked] if reranked else [r.text for r in results[:3]]
 
-    from config import OPENAI_API_KEY
-    if OPENAI_API_KEY and contexts:
-        try:
-            from openai import OpenAI
-            client = OpenAI()
-            context_str = "\n\n".join(contexts)
-            resp = client.chat.completions.create(model="gpt-4o-mini", messages=[
-                {"role": "system", "content": "Trả lời CHỈ dựa trên context. Nếu không có → nói 'Không tìm thấy.'"},
-                {"role": "user", "content": f"Context:\n{context_str}\n\nCâu hỏi: {query}"},
-            ])
-            answer = resp.choices[0].message.content
-        except Exception as e:
-            print(f"  ⚠️  LLM generation failed: {e}", flush=True)
+    from config import LLM_MODEL, get_llm_client
+    client = get_llm_client()
+    if client and contexts:
+        models_to_try = [LLM_MODEL, "gemini-3.5-flash-lite", "gemini-flash-lite-latest", "gemini-3.1-flash-lite"]
+        seen = set()
+        unique_models = [m for m in models_to_try if not (m in seen or seen.add(m))]
+        answer = None
+        for m in unique_models:
+            try:
+                context_str = "\n\n".join(contexts)
+                resp = client.chat.completions.create(model=m, messages=[
+                    {"role": "system", "content": "Trả lời CHỈ dựa trên context. Nếu không có → nói 'Không tìm thấy.'"},
+                    {"role": "user", "content": f"Context:\n{context_str}\n\nCâu hỏi: {query}"},
+                ])
+                answer = resp.choices[0].message.content
+                break
+            except Exception as e:
+                if "429" in str(e) or "quota" in str(e).lower() or "ResourceExhausted" in str(e):
+                    continue
+                print(f"  ⚠️  LLM generation failed on {m}: {e}", flush=True)
+        if answer is None:
             answer = contexts[0]
     else:
         answer = contexts[0] if contexts else "Không tìm thấy thông tin."

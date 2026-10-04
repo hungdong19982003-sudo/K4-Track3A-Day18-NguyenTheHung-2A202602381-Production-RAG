@@ -33,32 +33,78 @@ class EnrichedChunk:
 # ─── Technique 1: Chunk Summarization ────────────────────
 
 
+import json as _json
+import re as _re
+from config import LLM_MODEL, get_llm_client
+
+_CACHE_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "reports", "enrichment_cache.json")
+_ENRICH_CACHE = None
+
+def _get_cache():
+    global _ENRICH_CACHE
+    if _ENRICH_CACHE is None:
+        _ENRICH_CACHE = {}
+        if os.path.exists(_CACHE_FILE):
+            try:
+                with open(_CACHE_FILE, "r", encoding="utf-8") as f:
+                    _ENRICH_CACHE = _json.load(f)
+            except Exception:
+                _ENRICH_CACHE = {}
+    return _ENRICH_CACHE
+
+def _save_cache():
+    if _ENRICH_CACHE:
+        try:
+            os.makedirs(os.path.dirname(_CACHE_FILE), exist_ok=True)
+            with open(_CACHE_FILE, "w", encoding="utf-8") as f:
+                _json.dump(_ENRICH_CACHE, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
+def _call_llm_with_fallback(messages: list[dict], max_tokens: int = 200) -> str | None:
+    client = get_llm_client()
+    if not client:
+        return None
+    models_to_try = [LLM_MODEL, "gemini-3.5-flash-lite", "gemini-flash-lite-latest", "gemini-3.1-flash-lite"]
+    seen = set()
+    unique_models = [m for m in models_to_try if not (m in seen or seen.add(m))]
+    for m in unique_models:
+        try:
+            resp = client.chat.completions.create(model=m, messages=messages, max_tokens=max_tokens)
+            content = resp.choices[0].message.content.strip()
+            if content:
+                return content
+        except Exception as e:
+            if "429" in str(e) or "quota" in str(e).lower() or "ResourceExhausted" in str(e):
+                continue
+    return None
+
 def summarize_chunk(text: str) -> str:
     """
     Tạo summary ngắn cho chunk.
     Embed summary thay vì (hoặc cùng với) raw chunk → giảm noise.
     """
-    # TODO: Implement chunk summarization
-    # if OPENAI_API_KEY:
-    #     try:
-    #         from openai import OpenAI
-    #         client = OpenAI()
-    #         resp = client.chat.completions.create(
-    #             model="gpt-4o-mini",
-    #             messages=[
-    #                 {"role": "system", "content": "Tóm tắt đoạn văn sau trong 2-3 câu ngắn gọn bằng tiếng Việt."},
-    #                 {"role": "user", "content": text},
-    #             ],
-    #             max_tokens=150,
-    #         )
-    #         return resp.choices[0].message.content.strip()
-    #     except Exception as e:
-    #         print(f"  ⚠️  OpenAI summarize failed: {e}")
-    #
-    # Extractive fallback (không cần API):
-    # sentences = [s.strip() for s in text.replace("\n", " ").split(". ") if s.strip()]
-    # return ". ".join(sentences[:2]) + "." if sentences else text
-    return text
+    import hashlib
+    text_hash = hashlib.md5(text.encode("utf-8")).hexdigest()
+    cache_key = f"summary:{text_hash}"
+    cache = _get_cache()
+    if cache_key in cache:
+        return cache[cache_key]
+
+    content = _call_llm_with_fallback([
+        {"role": "system", "content": "Tóm tắt đoạn văn sau trong 1 câu thật ngắn gọn bằng tiếng Việt (dưới 15 từ)."},
+        {"role": "user", "content": text},
+    ], max_tokens=80)
+    if content and len(content) <= len(text) * 1.8:
+        cache[cache_key] = content
+        _save_cache()
+        return content
+
+    sentences = [s.strip() for s in text.replace("\n", " ").split(". ") if s.strip()]
+    fallback = sentences[0] if sentences else text
+    if len(fallback) > len(text) * 1.5:
+        fallback = text[:len(text) // 2]
+    return fallback
 
 
 # ─── Technique 2: Hypothesis Question-Answer (HyQA) ─────
@@ -69,29 +115,35 @@ def generate_hypothesis_questions(text: str, n_questions: int = 3) -> list[str]:
     Generate câu hỏi mà chunk có thể trả lời.
     Index cả questions lẫn chunk → query match tốt hơn (bridge vocabulary gap).
     """
-    # TODO: Implement HyQA generation
-    # if OPENAI_API_KEY:
-    #     try:
-    #         from openai import OpenAI
-    #         client = OpenAI()
-    #         resp = client.chat.completions.create(
-    #             model="gpt-4o-mini",
-    #             messages=[
-    #                 {"role": "system", "content": f"Dựa trên đoạn văn, tạo {n_questions} câu hỏi mà đoạn văn có thể trả lời. Trả về mỗi câu hỏi trên 1 dòng."},
-    #                 {"role": "user", "content": text},
-    #             ],
-    #             max_tokens=200,
-    #         )
-    #         questions = resp.choices[0].message.content.strip().split("\n")
-    #         return [q.strip().lstrip("0123456789.-) ") for q in questions if q.strip()][:n_questions]
-    #     except Exception as e:
-    #         print(f"  ⚠️  OpenAI HyQA failed: {e}")
-    #
-    # Extractive fallback:
-    # import re
-    # sentences = [s.strip() for s in re.split(r'[.!?\n]', text) if len(s.strip()) > 10]
-    # return [f"{s.rstrip('.')}?" for s in sentences[:n_questions]]
-    return []
+    import hashlib
+    text_hash = hashlib.md5(text.encode("utf-8")).hexdigest()
+    cache_key = f"hyqa:{text_hash}:{n_questions}"
+    cache = _get_cache()
+    if cache_key in cache:
+        return cache[cache_key]
+
+    content = _call_llm_with_fallback([
+        {"role": "system", "content": f"Dựa trên đoạn văn, hãy tạo {n_questions} câu hỏi bằng tiếng Việt có kết thúc bằng dấu chấm hỏi (?). Mỗi câu hỏi nằm trên một dòng riêng biệt."},
+        {"role": "user", "content": text},
+    ], max_tokens=150)
+    if content:
+        questions = content.split("\n")
+        cleaned = [q.strip().lstrip("0123456789.-*#) ") for q in questions if q.strip()]
+        valid_qs = [q if q.endswith("?") else f"{q}?" for q in cleaned if len(q) > 5]
+        if valid_qs:
+            res = valid_qs[:n_questions]
+            cache[cache_key] = res
+            _save_cache()
+            return res
+
+    sentences = [s.strip() for s in _re.split(r'[.!?\n]', text) if len(s.strip()) > 5]
+    if not sentences:
+        sentences = [text]
+    fallback_qs = []
+    for s in sentences[:n_questions]:
+        clean = s.rstrip('.!?')
+        fallback_qs.append(f"{clean} như thế nào?")
+    return fallback_qs
 
 
 # ─── Technique 3: Contextual Prepend (Anthropic style) ──
@@ -102,28 +154,25 @@ def contextual_prepend(text: str, document_title: str = "") -> str:
     Prepend context giải thích chunk nằm ở đâu trong document.
     Anthropic benchmark: giảm 49% retrieval failure (alone).
     """
-    # TODO: Implement contextual prepend
-    # if OPENAI_API_KEY:
-    #     try:
-    #         from openai import OpenAI
-    #         client = OpenAI()
-    #         resp = client.chat.completions.create(
-    #             model="gpt-4o-mini",
-    #             messages=[
-    #                 {"role": "system", "content": "Viết 1 câu ngắn mô tả đoạn văn này nằm ở đâu trong tài liệu và nói về chủ đề gì. Chỉ trả về 1 câu."},
-    #                 {"role": "user", "content": f"Tài liệu: {document_title}\n\nĐoạn văn:\n{text}"},
-    #             ],
-    #             max_tokens=80,
-    #         )
-    #         context = resp.choices[0].message.content.strip()
-    #         return f"{context}\n\n{text}"
-    #     except Exception as e:
-    #         print(f"  ⚠️  OpenAI contextual failed: {e}")
-    #
-    # Simple fallback:
-    # prefix = f"Trích từ {document_title}. " if document_title else ""
-    # return f"{prefix}{text}"
-    return text
+    import hashlib
+    text_hash = hashlib.md5(text.encode("utf-8")).hexdigest()
+    cache_key = f"contextual:{text_hash}:{document_title}"
+    cache = _get_cache()
+    if cache_key in cache:
+        return cache[cache_key]
+
+    content = _call_llm_with_fallback([
+        {"role": "system", "content": "Viết 1 câu ngắn mô tả đoạn văn này nằm ở đâu trong tài liệu và nói về chủ đề gì. Chỉ trả về đúng 1 câu duy nhất."},
+        {"role": "user", "content": f"Tài liệu: {document_title}\n\nĐoạn văn:\n{text}"},
+    ], max_tokens=80)
+    if content:
+        res = f"{content}\n\n{text}"
+        cache[cache_key] = res
+        _save_cache()
+        return res
+
+    prefix = f"Trích từ {document_title}. " if document_title else ""
+    return f"{prefix}{text}"
 
 
 # ─── Technique 4: Auto Metadata Extraction ──────────────
@@ -133,26 +182,29 @@ def extract_metadata(text: str) -> dict:
     """
     LLM extract metadata tự động: topic, entities, date_range, category.
     """
-    # TODO: Implement auto metadata extraction
-    # if OPENAI_API_KEY:
-    #     try:
-    #         import json as _json
-    #         from openai import OpenAI
-    #         client = OpenAI()
-    #         resp = client.chat.completions.create(
-    #             model="gpt-4o-mini",
-    #             messages=[
-    #                 {"role": "system", "content": 'Trích xuất metadata từ đoạn văn. Trả về JSON: {"topic": "...", "entities": ["..."], "category": "policy|hr|it|finance", "language": "vi|en"}'},
-    #                 {"role": "user", "content": text},
-    #             ],
-    #             max_tokens=150,
-    #         )
-    #         return _json.loads(resp.choices[0].message.content)
-    #     except Exception as e:
-    #         print(f"  ⚠️  OpenAI metadata failed: {e}")
-    #
-    # return {"topic": "general", "entities": [], "category": "policy", "language": "vi"}
-    return {}
+    import hashlib
+    text_hash = hashlib.md5(text.encode("utf-8")).hexdigest()
+    cache_key = f"metadata:{text_hash}"
+    cache = _get_cache()
+    if cache_key in cache:
+        return cache[cache_key]
+
+    content = _call_llm_with_fallback([
+        {"role": "system", "content": 'Trích xuất metadata từ đoạn văn. Trả về CHỈ duy nhất 1 JSON hợp lệ: {"topic": "...", "entities": ["..."], "category": "policy|hr|it|finance", "language": "vi"}'},
+        {"role": "user", "content": text},
+    ], max_tokens=150)
+    if content:
+        try:
+            if "```" in content:
+                content = _re.sub(r'```(?:json)?', '', content).strip()
+            res = _json.loads(content)
+            cache[cache_key] = res
+            _save_cache()
+            return res
+        except Exception:
+            pass
+
+    return {"topic": "general", "entities": [], "category": "policy", "language": "vi"}
 
 
 # ─── Combined Single-Call Mode ───────────────────────────
@@ -163,30 +215,53 @@ def _enrich_single_call(text: str, source: str) -> dict:
 
     ⚠️ Cost optimization: 1 API call thay vì 4 calls riêng lẻ.
     """
-    # TODO: Implement combined enrichment (1 call/chunk)
-    # if OPENAI_API_KEY:
-    #     try:
-    #         import json as _json
-    #         from openai import OpenAI
-    #         client = OpenAI()
-    #         resp = client.chat.completions.create(
-    #             model="gpt-4o-mini",
-    #             messages=[
-    #                 {"role": "system", "content": """Phân tích đoạn văn và trả về JSON:
-    # {
-    #   "summary": "tóm tắt 2-3 câu",
-    #   "questions": ["câu hỏi 1", "câu hỏi 2", "câu hỏi 3"],
-    #   "context": "1 câu mô tả đoạn văn nằm ở đâu trong tài liệu",
-    #   "metadata": {"topic": "...", "entities": ["..."], "category": "policy|hr|it|finance", "language": "vi|en"}
-    # }"""},
-    #                 {"role": "user", "content": f"Tài liệu: {source}\n\nĐoạn văn:\n{text}"},
-    #             ],
-    #             max_tokens=400,
-    #         )
-    #         return _json.loads(resp.choices[0].message.content)
-    #     except Exception as e:
-    #         print(f"  ⚠️  Enrichment API failed: {e}")
-    return {}
+    import hashlib
+    text_hash = hashlib.md5(text.encode("utf-8")).hexdigest()
+    cache = _get_cache()
+    if text_hash in cache:
+        return cache[text_hash]
+
+    models_to_try = [LLM_MODEL, "gemini-3.5-flash-lite", "gemini-flash-lite-latest", "gemini-3.1-flash-lite"]
+    seen = set()
+    unique_models = [m for m in models_to_try if not (m in seen or seen.add(m))]
+    client = get_llm_client()
+    if client:
+        for m in unique_models:
+            try:
+                resp = client.chat.completions.create(
+                    model=m,
+                    messages=[
+                        {"role": "system", "content": """Phân tích đoạn văn và trả về CHỈ duy nhất 1 JSON hợp lệ có định dạng:
+{
+  "summary": "tóm tắt 1-2 câu",
+  "questions": ["câu hỏi 1", "câu hỏi 2", "câu hỏi 3"],
+  "context": "1 câu mô tả vị trí và chủ đề đoạn văn trong tài liệu",
+  "metadata": {"topic": "...", "entities": ["..."], "category": "policy|hr|it|finance", "language": "vi"}
+}"""},
+                        {"role": "user", "content": f"Tài liệu: {source}\n\nĐoạn văn:\n{text}"},
+                    ],
+                    max_tokens=400,
+                )
+                content = resp.choices[0].message.content.strip()
+                if "```" in content:
+                    content = _re.sub(r'```(?:json)?', '', content).strip()
+                parsed = _json.loads(content)
+                cache[text_hash] = parsed
+                _save_cache()
+                return parsed
+            except Exception as e:
+                if "429" in str(e) or "quota" in str(e).lower() or "ResourceExhausted" in str(e):
+                    continue
+                print(f"  ⚠️  Enrichment API failed on {m}: {e}")
+
+    sentences = [s.strip() for s in text.replace("\n", " ").split(". ") if s.strip()]
+    fallback = {
+        "summary": sentences[0] if sentences else text,
+        "questions": [f"{s.rstrip('.')}?" for s in sentences[:3]],
+        "context": f"Tài liệu: {source}" if source else "",
+        "metadata": {"topic": "general", "entities": [], "category": "policy", "language": "vi"},
+    }
+    return fallback
 
 
 # ─── Full Enrichment Pipeline ────────────────────────────
